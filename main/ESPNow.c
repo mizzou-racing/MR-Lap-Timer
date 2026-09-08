@@ -1,0 +1,173 @@
+#include "ESPNow.h"
+
+#define TAG ((const char *const) "ESPNow")
+
+//No longer needed
+    // esp_now_peer_info_t mainInfo = 
+    // {
+    //     .peer_addr[0] = 0xf0,
+    //     .peer_addr[1] = 0x9e,
+    //     .peer_addr[2] = 0x9e,
+    //     .peer_addr[3] = 0x55,
+    //     .peer_addr[4] = 0x15,
+    //     .peer_addr[5] = 0x48,
+    //     .channel = 11,
+    //     .ifidx = ESP_IF_WIFI_STA,
+    //     .encrypt = false
+    // };
+
+    //Segment: f0:9e:9e:55:15:08 
+    // esp_now_peer_info_t segInfo = 
+    // {
+    //     .peer_addr[0] = 0xf0,
+    //     .peer_addr[1] = 0x9e,
+    //     .peer_addr[2] = 0x9e,
+    //     .peer_addr[3] = 0x55,
+    //     .peer_addr[4] = 0x15,
+    //     .peer_addr[5] = 0x08,
+    //     .channel = 11,
+    //     .ifidx = ESP_IF_WIFI_STA,
+    //     .encrypt = false
+    // };
+
+// Paddock: 70:04:1d:b7:01:68
+esp_now_peer_info_t paddockInfo = {
+    .peer_addr[0] = 0x70,
+    .peer_addr[1] = 0x04,
+    .peer_addr[2] = 0x1d,
+    .peer_addr[3] = 0xb7,
+    .peer_addr[4] = 0x01,
+    .peer_addr[5] = 0x68,
+    .channel = PADDOCK_CHANNEL,
+    .ifidx = ESP_IF_WIFI_STA,
+    .encrypt = false
+};
+
+// Forward declarations for callbacks
+static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status);
+static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len);
+
+/**
+ * @brief Send callback - called when ESP-NOW transmission completes
+ * Note: This is called AFTER esp_now_send() returns, indicates ACK status
+ */
+static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        // Transmission successful (got ACK from peer)
+        ESP_LOGI(TAG, "ESP-NOW data sent successfully");
+    } else {
+        // Transmission failed (no ACK from peer) - status=1 means ESP_NOW_SEND_FAIL
+        ESP_LOGW(TAG, "ESP-NOW ACK failed to " MACSTR " (status=%d, likely no ACK from peer)",
+                 MAC2STR(tx_info->des_addr), status);
+    }
+}
+
+/**
+ * @brief Receive callback - called when ESP-NOW data is received
+ * Note: Called from WiFi task context - keep this fast to prevent watchdog issues
+ */
+static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
+    //Shouldn't be receiving anything
+}
+
+static esp_err_t nvs_init() {   
+    ESP_LOGI(TAG, "Initializing NVS flash");
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    return ret;
+}
+
+static esp_err_t espnow_wifi_init() {
+    ESP_LOGI(TAG, "Initializing Wi-Fi");
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    //Initialize Wi-Fi in station mode
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Enable Wi-Fi power save mode to reduce power consumption (optional, can be adjusted based on application needs)
+    // wifi_ps_type_t ps_type = WIFI_PS_MIN_MODEM;
+    // esp_wifi_set_ps(ps_type);  // Enable WiFi power save mode
+
+    esp_wifi_set_max_tx_power(8);  // Reduce TX power from 20 to 8 (50% power reduction)
+
+
+    // Promiscuous mode must be temporarily enabled to change the channel in STA mode
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+    ESP_ERROR_CHECK(esp_wifi_set_channel(PADDOCK_CHANNEL, WIFI_SECOND_CHAN_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(false));
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Initialize ESP-NOW wireless communication
+ * @return ESP_OK on success, error code on failure
+ */
+int espnow_init() {
+    // Step 1: Initialize NVS (required for WiFi)
+    ESP_LOGI(TAG, "Initializing NVS flash");
+    ESP_ERROR_CHECK(nvs_init());
+
+    // Step 2: Initialize WiFI (required before ESP-NOW)
+    espnow_wifi_init();
+
+    // Step 3: Initialize RX queue for non-blocking serial output (Receiving from other timer)
+    //rx_queue = xQueueCreate(RX_QUEUE_SIZE, sizeof(espnow_rx_packet_t));
+    // if (rx_queue == NULL) {
+    //     ESP_LOGE(TAG, "Failed to create RX queue");
+    //     return ESP_ERR_NO_MEM;
+    // }
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    ESP_LOGE(TAG, "MAC Address: %02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    //Initialize ESPNow
+    ESP_ERROR_CHECK(esp_now_init());
+    ESP_LOGI(TAG,"ESPNow init success!!");
+    
+    // Step 4: Register peers and callbacks
+    ESP_ERROR_CHECK(esp_now_add_peer(&paddockInfo));
+    ESP_ERROR_CHECK(esp_now_register_send_cb(espnow_send_cb));
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
+
+    // ESP_LOGI(TAG, "ESP-NOW initialization complete");
+    return ESP_OK;
+}
+
+/**
+ * @brief Send ESP-NOW data to a specific peer
+ * @param dest_mac Destination MAC address (6 bytes)
+ * @param data Pointer to data buffer
+ * @param length Data length in bytes (max 250)
+ * @return ESP_OK on success, error code on failure
+ */
+int espnow_send(const uint8_t *dest_mac, uint8_t* data, size_t length) {
+    if (length > MAX_MSG_LEN) {
+        ESP_LOGE(TAG, "Data length exceeds maximum ESP-NOW payload");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    esp_err_t result = esp_now_send(dest_mac, data, length);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to send ESP-NOW data: %s", esp_err_to_name(result));
+        return result;
+    }
+
+    return ESP_OK;
+}
+
+void trigger_paddock() {
+    uint32_t data[2] = {0, -1};
+
+    espnow_send(paddockInfo.peer_addr, (uint8_t*)(&data), sizeof(data));
+}
+
+#undef TAG
